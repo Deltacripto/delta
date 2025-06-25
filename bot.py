@@ -1,18 +1,19 @@
-# bot.py – versión con estado persistente en Google Sheets
-# --------------------------------------------------------
+# bot.py – versión con estado persistente en Google Sheets + keep-alive
+# --------------------------------------------------------------------
 from flask import Flask, request
 import requests
 import os
 from datetime import datetime
+import threading, time                       # ← añadido
 
-# ------------------------ Google Sheets ------------------
+# ------------------------ Google Sheets -----------------------------
 from google_sheets import cargar_estado_desde_google, guardar_estado_en_google
 precios_entrada, fechas_entrada = cargar_estado_desde_google()
 
 def guardar_estado():
     guardar_estado_en_google(precios_entrada, fechas_entrada)
 
-# ------------------ Configuraciones básicas --------------
+# ------------------ Configuraciones básicas -------------------------
 app = Flask(__name__)
 
 BOT_TOKEN_DELTA = "7876669003:AAEDoCKopyQY8d3-hjj4L_vdR3-TdNi_TMc"
@@ -29,21 +30,23 @@ WORDPRESS_ENDPOINT_ALT = "https://cryptosignalbot.com/wp-json/dashboard/v1/ver-h
 TELEGRAM_KEY   = "Bossio.18357009"
 APALANCAMIENTO = 3
 
-# -------------------------- Rutas Flask ------------------
+# ------------------------- Rutas Flask ------------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
     print(f"[DEBUG] Datos recibidos: {data}")
     return process_signal(data)
 
-# ----------------- Lógica principal de señales ----------
+@app.route("/ping", methods=["GET"])          # ← nueva ruta
+def ping():
+    return "pong", 200
+
+# -------------------- Lógica principal de señales -------------------
 def process_signal(data):
     global precios_entrada, fechas_entrada
-
     ticker      = data.get("ticker", "No especificado")
-    action      = data.get("order_action", "").lower()         # buy / sell / close
+    action      = data.get("order_action", "").lower()
     order_price = data.get("order_price")
-    _           = data.get("stop_loss")                        # ignorado
 
     if not order_price:
         return "Precio no proporcionado", 400
@@ -55,22 +58,18 @@ def process_signal(data):
 
     fecha_hoy = datetime.now().strftime("%d/%m/%Y")
 
-    # --------------------- BUY ----------------------------
+    # -------------------------- BUY ---------------------------------
     if action == "buy":
-        stop_loss_value            = round(float(order_price) * 0.80, 4)
-        precios_entrada[asset_es]  = float(order_price)
-        fechas_entrada[asset_es]   = fecha_hoy
+        stop_loss_value           = round(float(order_price) * 0.80, 4)
+        precios_entrada[asset_es] = float(order_price)
+        fechas_entrada[asset_es]  = fecha_hoy
         guardar_estado()
 
-        mensaje_compra_es = construir_mensaje_compra_es(
-            asset_es, order_price, stop_loss_value, fecha_hoy
-        )
-        mensaje_compra_en = build_buy_message_en(
-            asset_en, order_price, stop_loss_value, fecha_hoy
-        )
+        msg_es = construir_mensaje_compra_es(asset_es, order_price, stop_loss_value, fecha_hoy)
+        msg_en = build_buy_message_en(asset_en, order_price, stop_loss_value, fecha_hoy)
 
-        send_telegram_group_message_with_button_es(GROUP_CHAT_ID_ES, topic_id_es, mensaje_compra_es)
-        send_telegram_group_message_with_button_en(GROUP_CHAT_ID_EN, topic_id_en, mensaje_compra_en)
+        send_telegram_group_message_with_button_es(GROUP_CHAT_ID_ES, topic_id_es, msg_es)
+        send_telegram_group_message_with_button_en(GROUP_CHAT_ID_EN, topic_id_en, msg_en)
 
         payload_wp = {
             "telegram_key": TELEGRAM_KEY,
@@ -82,10 +81,9 @@ def process_signal(data):
         }
         enviar_a_wordpress(WORDPRESS_ENDPOINT, payload_wp)
         enviar_a_wordpress(WORDPRESS_ENDPOINT_ALT, payload_wp)
-
         return "OK", 200
 
-    # ----------------- SELL / CLOSE -----------------------
+    # --------------------- SELL / CLOSE -----------------------------
     if action in ["sell", "close"]:
         if asset_es in precios_entrada and precios_entrada[asset_es] is not None:
             precio_entrada   = precios_entrada[asset_es]
@@ -95,17 +93,17 @@ def process_signal(data):
             profit_percent           = (precio_salida - precio_entrada) / precio_entrada * 100
             profit_percent_leveraged = profit_percent * APALANCAMIENTO
 
-            mensaje_cierre_es = construir_mensaje_cierre_es(
+            msg_es = construir_mensaje_cierre_es(
                 asset_es, precio_entrada, precio_salida,
                 profit_percent_leveraged, fecha_entrada_op, fecha_hoy
             )
-            mensaje_cierre_en = build_close_message_en(
+            msg_en = build_close_message_en(
                 asset_en, precio_entrada, precio_salida,
                 profit_percent_leveraged, fecha_entrada_op, fecha_hoy
             )
 
-            send_telegram_group_message_with_button_es(GROUP_CHAT_ID_ES, topic_id_es, mensaje_cierre_es)
-            send_telegram_group_message_with_button_en(GROUP_CHAT_ID_EN, topic_id_en, mensaje_cierre_en)
+            send_telegram_group_message_with_button_es(GROUP_CHAT_ID_ES, topic_id_es, msg_es)
+            send_telegram_group_message_with_button_en(GROUP_CHAT_ID_EN, topic_id_en, msg_en)
 
             precios_entrada[asset_es] = None
             fechas_entrada[asset_es]  = None
@@ -121,11 +119,21 @@ def process_signal(data):
             }
             enviar_a_wordpress(WORDPRESS_ENDPOINT, payload_wp)
             enviar_a_wordpress(WORDPRESS_ENDPOINT_ALT, payload_wp)
-
             return "OK", 200
         return "No hay posición abierta para cerrar", 400
 
     return "OK", 200
+
+# -------------- Keep-alive: ping cada 5 minutos ---------------------
+def _keep_alive():
+    url = os.getenv("KEEPALIVE_URL", "https://delta-f42n.onrender.com/ping")
+    while True:
+        try:
+            requests.get(url, timeout=10)
+            print(f"[KEEPALIVE] Ping OK → {url}")
+        except Exception as e:
+            print(f"[KEEPALIVE] Error: {e}")
+        time.sleep(300)  # 5 min
 
 # ------------------- Construcción de mensajes ------------
 def construir_mensaje_compra_es(asset, order_price, stop_loss, fecha_hoy):
