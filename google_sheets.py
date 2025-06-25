@@ -62,12 +62,11 @@ def cargar_estado_desde_google():
     return precios, fechas
 
 def guardar_estado_en_google(precios, fechas):
-    hoja = conectar_hoja()
-    hoja.clear()
-    hoja.append_row(["asset", "entry_price", "entry_date"])
+    sheet = conectar_hoja()
+    # no borrar la hoja
     for asset in precios:
-        hoja.append_row([
-            asset,
-            precios.get(asset, ""),
-            fechas.get(asset, ""),
+        precio = precios[asset]
+        fecha  = fechas[asset]
+        if precio is not None:
+            sheet.append_row([asset, precio, fecha]),
         ])
