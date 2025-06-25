@@ -1,17 +1,17 @@
 # bot.py – versión con estado persistente en Google Sheets + keep-alive
-# --------------------------------------------------------------------
+# -------------------------------------------------------------------
 from flask import Flask, request
 import requests, os, threading, time
 from datetime import datetime
 
-# -------------------------- Google Sheets ---------------------------
+# ------------------------ Google Sheets ----------------------------
 from google_sheets import cargar_estado_desde_google, guardar_estado_en_google
 precios_entrada, fechas_entrada = cargar_estado_desde_google()
 
 def guardar_estado():
     guardar_estado_en_google(precios_entrada, fechas_entrada)
 
-# --------------------- Configuraciones básicas ----------------------
+# ------------------- Configuraciones básicas -----------------------
 app = Flask(__name__)
 
 BOT_TOKEN_DELTA  = "7876669003:AAEDoCKopyQY8d3-hjj4L_vdR3-TdNi_TMc"
@@ -27,18 +27,29 @@ WORDPRESS_ENDPOINT_ALT = "https://cryptosignalbot.com/wp-json/dashboard/v1/ver-h
 TELEGRAM_KEY   = "Bossio.18357009"
 APALANCAMIENTO = 3
 
-# ----------------------------- Rutas --------------------------------
+# ----------------------------- Rutas -------------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
     data = request.json
     print(f"[DEBUG] Datos recibidos: {data}")
     return process_signal(data)
 
-@app.route("/ping", methods=["GET"])                # ruta keep-alive
+@app.route("/ping", methods=["GET"])          # ruta keep-alive
 def ping():
     return "pong", 200
 
-# ---------------------- Lógica de señales ---------------------------
+# ---------------- Keep-alive cada 5 minutos ------------------------
+def _keep_alive():
+    url = os.getenv("KEEPALIVE_URL", "https://delta-f42n.onrender.com/ping")
+    while True:
+        try:
+            requests.get(url, timeout=10)
+            print(f"[KEEPALIVE] Ping OK → {url}")
+        except Exception as e:
+            print(f"[KEEPALIVE] Error: {e}")
+        time.sleep(300)  # 5 min
+
+# -------------------- Lógica de señales ---------------------------
 def process_signal(data):
     global precios_entrada, fechas_entrada
     ticker      = data.get("ticker", "No especificado")
@@ -55,7 +66,7 @@ def process_signal(data):
 
     fecha_hoy = datetime.now().strftime("%d/%m/%Y")
 
-    # --------------------------- BUY --------------------------------
+    # --------------------------- BUY -------------------------------
     if action == "buy":
         stop_loss_value           = round(float(order_price) * 0.80, 4)
         precios_entrada[asset_es] = float(order_price)
@@ -69,14 +80,18 @@ def process_signal(data):
         send_telegram_group_message_with_button_en(GROUP_CHAT_ID_EN, topic_id_en, msg_en)
 
         payload_wp = {
-            "telegram_key": TELEGRAM_KEY, "symbol": asset_es, "action": action,
-            "price": order_price, "stop_loss": stop_loss_value, "strategy": "fire_scalping",
+            "telegram_key": TELEGRAM_KEY,
+            "symbol": asset_es,
+            "action": action,
+            "price": order_price,
+            "stop_loss": stop_loss_value,
+            "strategy": "fire_scalping",
         }
         enviar_a_wordpress(WORDPRESS_ENDPOINT, payload_wp)
         enviar_a_wordpress(WORDPRESS_ENDPOINT_ALT, payload_wp)
         return "OK", 200
 
-    # ----------------------- SELL / CLOSE ---------------------------
+    # ----------------------- SELL / CLOSE --------------------------
     if action in ["sell", "close"]:
         if asset_es in precios_entrada and precios_entrada[asset_es] is not None:
             precio_entrada   = precios_entrada[asset_es]
@@ -103,8 +118,11 @@ def process_signal(data):
             guardar_estado()
 
             payload_wp = {
-                "telegram_key": TELEGRAM_KEY, "symbol": asset_es, "action": action,
-                "price": order_price, "strategy": "fire_scalping",
+                "telegram_key": TELEGRAM_KEY,
+                "symbol": asset_es,
+                "action": action,
+                "price": order_price,
+                "strategy": "fire_scalping",
                 "result": round(profit_percent_leveraged, 2),
             }
             enviar_a_wordpress(WORDPRESS_ENDPOINT, payload_wp)
