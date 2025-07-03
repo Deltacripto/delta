@@ -1,80 +1,89 @@
-# google_sheets.py – acceso a Google Sheets
-# • Variable GOOGLE_CREDS_JSON (JSON completo)  ← recomendado
-# • o archivo credenciales_google.json en disco
-# Si falta cualquiera de las dos, lanza un error claro.
-
-import os, tempfile, gspread
+import os
+import tempfile
+from datetime import datetime
+import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 
-# ---------- Config desde entorno ----------
-SCOPE = [
-    "https://spreadsheets.google.com/feeds",
-    "https://www.googleapis.com/auth/drive",
-]
-
+# ------------- Configuración Google Sheets -------------
+SCOPE       = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 CREDS_FILE  = os.getenv("GOOGLE_CREDS_FILENAME", "credenciales_google.json")
-CREDS_JSON  = os.getenv("GOOGLE_CREDS_JSON")        # JSON completo
-SHEET_NAME  = os.getenv("GOOGLE_SHEETS_NAME", "EstadoOperaciones")
+CREDS_JSON  = os.getenv("GOOGLE_CREDS_JSON")
+SHEET_NAME  = os.getenv("GOOGLE_SHEETS_NAME", "RegistroOperaciones")
 
-# ---------- Credenciales -------------------
 def _ensure_creds_file() -> str:
-    if CREDS_JSON:                                  # JSON en variable
+    if CREDS_JSON:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
-        tmp.write(CREDS_JSON.encode())
-        tmp.close()
+        tmp.write(CREDS_JSON.encode()); tmp.close()
         return tmp.name
-    if os.path.exists(CREDS_FILE):                  # archivo físico
+    if os.path.exists(CREDS_FILE):
         return CREDS_FILE
-    raise FileNotFoundError(
-        "❌ Credenciales de Google Sheets no encontradas.\n"
-        "• Sube credenciales_google.json o crea GOOGLE_CREDS_JSON."
-    )
+    raise FileNotFoundError("No se encontraron credenciales de Google Sheets.")
 
 CREDS_PATH = _ensure_creds_file()
 
-# ---------- Conexión ------------------------
 def conectar_hoja():
     creds  = ServiceAccountCredentials.from_json_keyfile_name(CREDS_PATH, SCOPE)
     client = gspread.authorize(creds)
-    return client.open(SHEET_NAME).sheet1           # primera pestaña
+    sheet  = client.open(SHEET_NAME).sheet1
+    # Cabecera ampliada con stop_programada y profit_pct
+    header = [
+        "activo",
+        "precio_entrada",
+        "fecha_hora_entrada",
+        "precio_salida",
+        "fecha_hora_salida",
+        "stop_programada",
+        "profit_pct"
+    ]
+    # Si no coincide, reiniciamos hoja
+    if sheet.row_count == 0 or sheet.row_values(1) != header:
+        sheet.clear()
+        sheet.append_row(header)
+    return sheet
 
-# ---------- Cargar estado --------------------
-def cargar_estado_desde_google():
-    hoja = conectar_hoja()
-    data = hoja.get_all_records()
-    precios, fechas = {}, {}
-    for row in data:
-        precios[row["asset"]] = float(row["entry_price"]) if row["entry_price"] else None
-        fechas[row["asset"]]  = row["entry_date"]         if row["entry_date"]  else None
-    return precios, fechas
-
-# ---------- Guardar estado -------------------
-def guardar_estado_en_google(precios, fechas):
+def registrar_entrada(activo: str, precio: float):
     sheet = conectar_hoja()
+    fecha = datetime.now().strftime("%Y-%m-%d %H:%M")
+    # Agregamos celdas vacías para las dos nuevas columnas
+    fila  = [activo, precio, fecha, "", "", "", ""]
+    sheet.append_row(fila)
 
-    # 1. asegurar cabecera
-    if sheet.row_count == 0 or sheet.cell(1, 1).value != "asset":
-        sheet.update("A1:C1", [["asset", "entry_price", "entry_date"]])
+def registrar_salida(activo: str, precio: float):
+    sheet = conectar_hoja()
+    fecha = datetime.now().strftime("%Y-%m-%d %H:%M")
+    data  = sheet.get_all_records()
 
-    # 2. leer datos actuales para saber qué filas modificar
-    records = sheet.get_all_records()               # list[dict]
-    index_by_asset = {row["asset"]: idx + 2 for idx, row in enumerate(records)}
-    # fila real = idx + 2 (porque header es fila 1)
+    # Buscar de abajo hacia arriba la primera fila sin precio_salida
+    for idx in range(len(data)-1, -1, -1):
+        row = data[idx]
+        if row["activo"] == activo and row["precio_salida"] == "":
+            fila_num = idx + 2  # +2: cabecera en fila 1
 
-    for asset in precios:
-        precio = precios[asset]
-        fecha  = fechas[asset]
-        fila   = index_by_asset.get(asset)
+            # 1) Actualizar precio de salida y fecha de salida
+            sheet.update_cell(fila_num, 4, precio)
+            sheet.update_cell(fila_num, 5, fecha)
 
-        # A) Cerrar posición → borrar fila si existe
-        if precio is None:
-            if fila:
-                sheet.delete_rows(fila)
-            continue
+            # 2) Recuperar precio de entrada limpio
+            entry_str   = sheet.cell(fila_num, 2).value
+            entry_price = float(str(entry_str).replace(",", "."))
 
-        # B) Actualizar fila existente
-        if fila:
-            sheet.update(f"A{fila}:C{fila}", [[asset, precio, fecha]])
-        # C) Fila nueva
-        else:
-            sheet.append_row([asset, precio, fecha])
+            # 3) Calcular y escribir stop_programada (3% abajo)
+            stop_prog = round(entry_price * 0.97, 6)
+            sheet.update_cell(fila_num, 6, stop_prog)
+
+            # 4) Calcular y escribir % de ganancia/pérdida (multiplicado por 10x para visual)
+            exit_price = float(str(precio).replace(",", "."))
+            profit_pct = round(((exit_price - entry_price) / entry_price * 100) * 10, 2)
+            sheet.update_cell(fila_num, 7, profit_pct)
+
+            # 5) Pintar la fila de rojo o verde según resultado
+            if profit_pct >= 0:
+                color = {"backgroundColor": {"red": 0, "green": 1, "blue": 0}}
+            else:
+                color = {"backgroundColor": {"red": 1, "green": 0, "blue": 0}}
+            # Rango desde la columna A hasta la G (7 columnas)
+            sheet.format(f"A{fila_num}:G{fila_num}", color)
+
+            return
+
+    raise ValueError(f"No hay operación abierta para '{activo}'.")
