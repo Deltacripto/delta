@@ -285,6 +285,7 @@ def build_close_message_en(asset, entry_price, exit_price,
             f"The market took an unexpected turn, but we applied our risk management strategy to minimize losses.\n\n"
             f"⏳ **Status:** Trade finalized."
         )
+    return msg
 
 def build_profit_channel_msg_en(asset, entry_price, exit_price,
                                 profit_leveraged, entry_date, close_date):
