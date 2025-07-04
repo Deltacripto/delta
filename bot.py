@@ -209,7 +209,8 @@ def construir_mensaje_cierre_es(asset, precio_entrada, precio_salida,
             f"de riesgo para minimizar pérdidas.\n\n"
             f"⏳ **Estado:** Operación finalizada."
         )
-
+    return msg
+					
 def construir_mensaje_ganancia_canal_es(asset, precio_entrada, precio_salida,
                                         profit_leveraged, fecha_entrada, fecha_cierre):
     return (
