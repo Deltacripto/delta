@@ -317,8 +317,8 @@ def build_profit_channel_msg_en(asset, entry_price, exit_price,
 		f"• 24/7 support for any questions or setup help\n\n"
 		f"---\n"
 		f"🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠 – FREE 🎉\n"
-		f"📊 Real-time signals, live charts and full market analysis completely FREE for 7 days.\n\n"
-		f"🔑 Claim your FREE for 7 days now! 🚀\n"
+		f"📊 Real-time signals, live charts and full market analysis completely FREE for 30 days.\n\n"
+		f"🔑 Claim your FREE for 30 days now! 🚀\n"
 	)
 
 # -------------------------------------------------------------------
