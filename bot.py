@@ -1,138 +1,185 @@
-# bot.py – versión con estado persistente en Google Sheets + keep-alive
-# -------------------------------------------------------------------
 from flask import Flask, request
-import requests, os, threading, time
+import requests
+import os
 from datetime import datetime
+import json
+import threading
+import time
 
-# ------------------------ Google Sheets ----------------------------
-from google_sheets import cargar_estado_desde_google, guardar_estado_en_google
-precios_entrada, fechas_entrada = cargar_estado_desde_google()
+# Importar funciones de Google Sheets
+from google_sheets import registrar_entrada, registrar_salida, conectar_hoja
 
-def guardar_estado():
-    guardar_estado_en_google(precios_entrada, fechas_entrada)
-
-# ------------------- Configuraciones básicas -----------------------
 app = Flask(__name__)
 
+# -------------------------------------------------------------------
+# 1. CONFIGURACIONES ESENCIALES
+# -------------------------------------------------------------------
 BOT_TOKEN_DELTA  = "7876669003:AAEDoCKopyQY8d3-hjj4L_vdR3-TdNi_TMc"
-GROUP_CHAT_ID_ES = "-1002299713092"
-GROUP_CHAT_ID_EN = "-1002428632182"
+TELEGRAM_KEY     = "Bossio.18357009"  # para el payload a WordPress
 
-TOPICS_ES = {"BTC": 4, "ETH": 11, "ADA": 2, "XRP": 9, "BNB": 7}
-TOPICS_EN = {"BTC": 6, "ETH": 8, "ADA": 14, "XRP": 10, "BNB": 12}
+# [ESPAÑOL] IDs de grupo y canal
+GROUP_CHAT_ID_ES   = "-1002299713092"  # Grupo en español
+CHANNEL_CHAT_ID_ES = "-1002440626725"  # Canal en español
 
+# Tópicos/hilos en el grupo ES
+TOPICS_ES = {
+    "BTC": 4,
+    "ETH": 11,
+    "ADA": 2,
+    "XRP": 9,
+    "BNB": 7
+}
+
+# [INGLÉS] IDs de grupo y canal
+GROUP_CHAT_ID_EN   = "-1002428632182"  # Grupo en inglés
+CHANNEL_CHAT_ID_EN = "-1002288256984"  # Canal en inglés
+
+# Tópicos/hilos en el grupo EN
+TOPICS_EN = {
+    "BTC": 6,
+    "ETH": 8,
+    "ADA": 14,
+    "XRP": 10,
+    "BNB": 12
+}
+
+# Endpoints de WordPress
 WORDPRESS_ENDPOINT     = "https://cryptosignalbot.com/wp-json/dashboard/v1/recibir-senales-swing"
 WORDPRESS_ENDPOINT_ALT = "https://cryptosignalbot.com/wp-json/dashboard/v1/ver-historial-swing"
 
-TELEGRAM_KEY   = "Bossio.18357009"
-APALANCAMIENTO = 3
+APALANCAMIENTO = 10
 
-# ----------------------------- Rutas -------------------------------
-@app.route("/webhook", methods=["POST"])
+# -------------------------------------------------------------------
+# 2. RUTA PRINCIPAL
+# -------------------------------------------------------------------
+@app.route('/webhook', methods=['POST'])
 def webhook():
-    data = request.json
+    data = request.json or {}
     print(f"[DEBUG] Datos recibidos: {data}")
     return process_signal(data)
 
-@app.route("/ping", methods=["GET"])          # ruta keep-alive
-def ping():
-    return "pong", 200
-
-# ---------------- Keep-alive cada 5 minutos ------------------------
-def _keep_alive():
-    url = os.getenv("KEEPALIVE_URL", "https://delta-f42n.onrender.com/ping")
-    while True:
-        try:
-            requests.get(url, timeout=10)
-            print(f"[KEEPALIVE] Ping OK → {url}")
-        except Exception as e:
-            print(f"[KEEPALIVE] Error: {e}")
-        time.sleep(300)  # 5 min
-
-# -------------------- Lógica de señales ---------------------------
+# -------------------------------------------------------------------
+# 3. LÓGICA PRINCIPAL
+# -------------------------------------------------------------------
 def process_signal(data):
-    global precios_entrada, fechas_entrada
-    ticker      = data.get("ticker", "No especificado")
-    action      = data.get("order_action", "").lower()
-    order_price = data.get("order_price")
+    ticker    = data.get('ticker', '').upper()
+    action    = data.get('order_action', '').lower()  # buy / sell / close
+
+    # Aceptar tanto coma como punto decimal
+    raw_price   = data.get('order_price', "")
+    order_price = str(raw_price).replace(',', '.')
 
     if not order_price:
         return "Precio no proporcionado", 400
 
-    asset_es, topic_id_es = identificar_activo_es(ticker)
-    asset_en, topic_id_en = identificar_activo_en(ticker)
-    if not asset_es or not asset_en:
+    # Identificar tópico
+    asset_es, topic_es = identificar_activo_es(ticker)
+    asset_en, topic_en = identificar_activo_en(ticker)
+    if not asset_es:
         return "Activo no reconocido", 400
 
     fecha_hoy = datetime.now().strftime("%d/%m/%Y")
 
-    # --------------------------- BUY -------------------------------
+    # ------- BUY -------
     if action == "buy":
-        stop_loss_value           = round(float(order_price) * 0.80, 4)
-        precios_entrada[asset_es] = float(order_price)
-        fechas_entrada[asset_es]  = fecha_hoy
-        guardar_estado()
+        registrar_entrada(ticker, float(order_price))
 
-        msg_es = construir_mensaje_compra_es(asset_es, order_price, stop_loss_value, fecha_hoy)
-        msg_en = build_buy_message_en(asset_en, order_price, stop_loss_value, fecha_hoy)
+        # stop al 20%
+        stop_loss    = round(float(order_price) * 0.80, 4)
+        msg_buy_es   = construir_mensaje_compra_es(asset_es, order_price, stop_loss, fecha_hoy)
+        msg_buy_en   = build_buy_message_en(asset_en, order_price, stop_loss, fecha_hoy)
 
-        send_telegram_group_message_with_button_es(GROUP_CHAT_ID_ES, topic_id_es, msg_es)
-        send_telegram_group_message_with_button_en(GROUP_CHAT_ID_EN, topic_id_en, msg_en)
+        send_telegram_group_message_with_button_es(GROUP_CHAT_ID_ES, topic_es, msg_buy_es)
+        send_telegram_group_message_with_button_en(GROUP_CHAT_ID_EN, topic_en, msg_buy_en)
 
-        payload_wp = {
+        payload = {
             "telegram_key": TELEGRAM_KEY,
             "symbol": asset_es,
             "action": action,
             "price": order_price,
-            "stop_loss": stop_loss_value,
-            "strategy": "fire_scalping",
+            "stop_loss": stop_loss,
+            "strategy": "fire_scalping"
         }
-        enviar_a_wordpress(WORDPRESS_ENDPOINT, payload_wp)
-        enviar_a_wordpress(WORDPRESS_ENDPOINT_ALT, payload_wp)
+        enviar_a_wordpress(WORDPRESS_ENDPOINT, payload)
+        enviar_a_wordpress(WORDPRESS_ENDPOINT_ALT, payload)
         return "OK", 200
 
-    # ----------------------- SELL / CLOSE --------------------------
-    if action in ["sell", "close"]:
-        if asset_es in precios_entrada and precios_entrada[asset_es] is not None:
-            precio_entrada   = precios_entrada[asset_es]
-            precio_salida    = float(order_price)
-            fecha_entrada_op = fechas_entrada.get(asset_es, "Desconocida")
+    # ------- SELL/CLOSE -------
+    if action in ("sell", "close"):
+        # 1) Recuperar de Sheets la última entrada abierta
+        sheet   = conectar_hoja()
+        records = sheet.get_all_records(value_render_option='UNFORMATTED_VALUE')
 
-            profit_percent           = (precio_salida - precio_entrada) / precio_entrada * 100
-            profit_percent_leveraged = profit_percent * APALANCAMIENTO
+        entry_price = None
+        entry_date  = None
+        for row in reversed(records):
+            if row["activo"] == ticker and row["precio_salida"] == "":
+                entry_price = float(str(row["precio_entrada"]).replace(',', '.'))
+                entry_date  = row["fecha_hora_entrada"]
+                break
+        if entry_price is None:
+            return "No hay posición abierta para cerrar", 400
 
-            msg_es = construir_mensaje_cierre_es(
-                asset_es, precio_entrada, precio_salida,
-                profit_percent_leveraged, fecha_entrada_op, fecha_hoy
+        # 2) Registrar la salida
+        registrar_salida(ticker, float(order_price))
+
+        exit_price      = float(order_price)
+        profit_pct      = (exit_price - entry_price) / entry_price * 100
+        profit_leverage = profit_pct * APALANCAMIENTO
+
+        msg_close_es = construir_mensaje_cierre_es(
+            asset_es, entry_price, exit_price, profit_leverage, entry_date, fecha_hoy
+        )
+        msg_close_en = build_close_message_en(
+            asset_en, entry_price, exit_price, profit_leverage, entry_date, fecha_hoy
+        )
+
+        send_telegram_group_message_with_button_es(GROUP_CHAT_ID_ES, topic_es, msg_close_es)
+        send_telegram_group_message_with_button_en(GROUP_CHAT_ID_EN, topic_en, msg_close_en)
+
+        if profit_leverage >= 0:
+            channel_es = construir_mensaje_ganancia_canal_es(
+                asset_es, entry_price, exit_price, profit_leverage, entry_date, fecha_hoy
             )
-            msg_en = build_close_message_en(
-                asset_en, precio_entrada, precio_salida,
-                profit_percent_leveraged, fecha_entrada_op, fecha_hoy
+            channel_en = build_profit_channel_msg_en(
+                asset_en, entry_price, exit_price, profit_leverage, entry_date, fecha_hoy
             )
+            send_telegram_channel_message_with_button_es(CHANNEL_CHAT_ID_ES, channel_es)
+            send_telegram_channel_message_with_button_en(CHANNEL_CHAT_ID_EN, channel_en)
 
-            send_telegram_group_message_with_button_es(GROUP_CHAT_ID_ES, topic_id_es, msg_es)
-            send_telegram_group_message_with_button_en(GROUP_CHAT_ID_EN, topic_id_en, msg_en)
-
-            precios_entrada[asset_es] = None
-            fechas_entrada[asset_es]  = None
-            guardar_estado()
-
-            payload_wp = {
-                "telegram_key": TELEGRAM_KEY,
-                "symbol": asset_es,
-                "action": action,
-                "price": order_price,
-                "strategy": "fire_scalping",
-                "result": round(profit_percent_leveraged, 2),
-            }
-            enviar_a_wordpress(WORDPRESS_ENDPOINT, payload_wp)
-            enviar_a_wordpress(WORDPRESS_ENDPOINT_ALT, payload_wp)
-            return "OK", 200
-        return "No hay posición abierta para cerrar", 400
+        # 3) Payload de cierre
+        payload = {
+            "telegram_key": TELEGRAM_KEY,
+            "symbol": asset_es,
+            "action": action,
+            "entry_price": entry_price,
+            "stop_loss": round(entry_price * 0.80, 4),
+            "price": order_price,
+            "strategy": "fire_scalping",
+            "result": round(profit_leverage, 2)
+        }
+        enviar_a_wordpress(WORDPRESS_ENDPOINT, payload)
+        enviar_a_wordpress(WORDPRESS_ENDPOINT_ALT, payload)
+        return "OK", 200
 
     return "OK", 200
 
-# ------------------- Construcción de mensajes ------------
+# -------------------------------------------------------------------
+# 4. KEEP-ALIVE para Render (ping cada 5m)
+# -------------------------------------------------------------------
+def _keep_alive():
+    url = os.getenv("KEEPALIVE_URL", "https://delta-f42n.onrender.com/ping")
+    while True:
+        try:
+            r = requests.get(url, timeout=10)
+            print(f"[KEEPALIVE] {r.status_code} → {url}")
+        except Exception as e:
+            print(f"[KEEPALIVE] Error: {e}")
+        time.sleep(300)
+
+# -------------------------------------------------------------------
+# 5. FUNCIONES MENSAJES (ESPAÑOL)
+# -------------------------------------------------------------------
 def construir_mensaje_compra_es(asset, order_price, stop_loss, fecha_hoy):
     return (
         f"🟢 **ABRIR LONG | ZONA CONFIRMADA**\n\n"
@@ -155,25 +202,56 @@ def construir_mensaje_cierre_es(asset, precio_entrada, precio_salida,
                                 profit_leveraged, fecha_entrada, fecha_cierre):
     if profit_leveraged >= 0:
         resultado_str = f"🟢 +{profit_leveraged:.2f}%"
-        encabezado = "🎯 **TARGET ALCANZADO | CERRAR TOMAR GANANCIAS**"
+        return (
+            f"🎯 **TARGET ALCANZADO | CERRAR TOMAR GANANCIAS**\n\n"
+            f"🚨 **Estrategia: 🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠**\n"
+            f"📈 **Operacion: Long**\n"
+            f"💰 **Activo:** {asset}/USDT\n"
+            f"✅ **Entrada:** {precio_entrada} USDT\n"
+            f"🔒 **Cierre:** {precio_salida} USDT\n"
+            f"📊 **Resultado:** {resultado_str}\n\n"
+            f"📡 **Estrategia 🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠 – Operación Cerrada**\n"
+            f"¡Felicidades! Hemos cerrado la operación con beneficios.\n\n"
+            f"⏳ **Estado:** Operación finalizada."
+        )
     else:
         resultado_str = f"🔴 {profit_leveraged:.2f}%"
-        encabezado = "🛑 **🔻 STOP LOSS ACTIVADO | CERRAR EN PÉRDIDA**"
+        return (
+            f"🛑 **🔻 STOP LOSS ACTIVADO | CERRAR EN PÉRDIDA**\n\n"
+            f"🚨 **Estrategia: 🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠**\n"
+            f"📈 **Operacion: Long**\n"
+            f"💰 **Activo:** {asset}/USDT\n"
+            f"✅ **Entrada:** {precio_entrada} USDT\n"
+            f"🔒 **Cierre:** {precio_salida} USDT\n"
+            f"📊 **Resultado:** {resultado_str}\n\n"
+            f"📡 **Estrategia 🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠 – Gestión de Riesgo**\n"
+            f"El mercado tomó una dirección inesperada, pero aplicamos nuestra gestión "
+            f"de riesgo para minimizar pérdidas.\n\n"
+            f"⏳ **Estado:** Operación finalizada."
+        )
 
+def construir_mensaje_ganancia_canal_es(asset, precio_entrada, precio_salida,
+                                        profit_leveraged, fecha_entrada, fecha_cierre):
     return (
-        f"{encabezado}\n\n"
+        f"🚀 **TARGET ALCANZADO | ¡Otra operación cerrada con éxito! 🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠**\n\n"
         f"🚨 **Estrategia: 🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠**\n"
-        f"📈 **Operacion: Long**\n"
         f"💰 **Activo:** {asset}/USDT\n"
         f"✅ **Entrada:** {precio_entrada} USDT\n"
         f"🔒 **Cierre:** {precio_salida} USDT\n"
-        f"⚖️ **Apalancamiento:** {APALANCAMIENTO}x\n"
-        f"📅 **Apertura:** {fecha_entrada}\n"
-        f"📅 **Cierre:** {fecha_cierre}\n"
-        f"📊 **Resultado:** {resultado_str}\n\n"
-        f"⏳ **Estado:** Operación finalizada."
+        f"📊 **Resultado:** 🟢 +{profit_leveraged:.2f}%\n\n"
+        f"📡 **Estrategia 🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠**\n"
+        f"Nuestro sistema Delta Swing detectó el momento óptimo para cerrar la operación y asegurar "
+        f"**beneficios en esta oportunidad de mercado**. Si quieres recibir nuestras señales VIP de "
+        f"la estrategia 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠 en **tiempo real**, suscríbete y accede a Señales, "
+        f"**gráficos en vivo, rendimiento detallado y la lista de operaciones cerradas**.\n\n"
+        f"🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠 – Prueba Gratuita por 30 Días🎉\n"
+        f"📊 Señales, gráficos en vivo y análisis en tiempo real completamente GRATIS por 30 días.\n\n"
+        f"🔑 ¡Obten tu Prueba Gratuita! 🚀\n"
     )
 
+# -------------------------------------------------------------------
+# 6. FUNCIONES MENSAJES (INGLÉS)
+# -------------------------------------------------------------------
 def build_buy_message_en(asset, order_price, stop_loss, fecha_hoy):
     return (
         f"🟢 **OPEN LONG | ZONE CONFIRMED**\n\n"
@@ -185,6 +263,9 @@ def build_buy_message_en(asset, order_price, stop_loss, fecha_hoy):
         f"⛔ **Stop Loss:** {stop_loss} USDT\n"
         f"📅 **Date:** {fecha_hoy}\n"
         f"🎯 **Take Profit:** **Real-time generated signal**\n\n"
+        f"🎯 **The Take Profit is triggered when an optimal exit point is detected.** Our team of analysts "
+        f"monitors the market in **real-time**, applying technical and fundamental analysis to identify "
+        f"the best opportunities. You will receive a message with all the details when the trade needs to be closed.\n\n"
         f"⏳ **Status:** IN PROGRESS, waiting for a closing signal...\n\n"
     )
 
@@ -192,95 +273,172 @@ def build_close_message_en(asset, entry_price, exit_price,
                            profit_leveraged, entry_date, close_date):
     if profit_leveraged >= 0:
         result_str = f"🟢 +{profit_leveraged:.2f}%"
-        header = "🎯 **TARGET REACHED | CLOSE TO TAKE PROFITS**"
+        msg = (
+            f"🎯 **TARGET REACHED | CLOSE TO TAKE PROFITS**\n\n"
+            f"🚨 **Strategy: 🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠**\n"
+            f"📈 **Operation: Long**\n"
+            f"💰 **Asset:** {asset}/USDT\n"
+            f"✅ **Entry:** {entry_price} USDT\n"
+            f"🔒 **Exit:** {exit_price} USDT\n"
+            f"⚖️ **Leverage:** {APALANCAMIENTO}x\n"
+            f"📅 **Opened:** {entry_date}\n"
+            f"📅 **Closed:** {close_date}\n"
+            f"📊 **Result:** {result_str}\n\n"
+            f"📡 **🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠 Strategy – Trade Closed**\n"
+            f"Congratulations! We have successfully closed the trade with profits.\n\n"
+            f"⏳ **Status:** Trade finalized."
+        )
     else:
         result_str = f"🔴 {profit_leveraged:.2f}%"
-        header = "🛑 **🔻 STOP LOSS TRIGGERED | CLOSE AT A LOSS**"
+        msg = (
+            f"🛑 **🔻 STOP LOSS TRIGGERED | CLOSE AT A LOSS**\n\n"
+            f"🚨 **Strategy: 🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠**\n"
+            f"📈 **Operation: Long**\n"
+            f"💰 **Asset:** {asset}/USDT\n"
+            f"✅ **Entry:** {entry_price} USDT\n"
+            f"🔒 **Exit:** {exit_price} USDT\n"
+            f"⚖️ **Leverage:** {APALANCAMIENTO}x\n"
+            f"📅 **Opened:** {entry_date}\n"
+            f"📅 **Closed:** {close_date}\n"
+            f"📊 **Result:** {result_str}\n\n"
+            f"📡 **🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠 Strategy – Risk Management**\n"
+            f"The market took an unexpected turn, but we applied our risk management strategy to minimize losses.\n\n"
+            f"⏳ **Status:** Trade finalized."
+        )
 
+def build_profit_channel_msg_en(asset, entry_price, exit_price,
+                                profit_leveraged, entry_date, close_date):
     return (
-        f"{header}\n\n"
-        f"🚨 **Strategy: 🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠**\n"
-        f"📈 **Operation: Long**\n"
-        f"💰 **Asset:** {asset}/USDT\n"
-        f"✅ **Entry:** {entry_price} USDT\n"
-        f"🔒 **Exit:** {exit_price} USDT\n"
-        f"⚖️ **Leverage:** {APALANCAMIENTO}x\n"
-        f"📅 **Opened:** {entry_date}\n"
-        f"📅 **Closed:** {close_date}\n"
-        f"📊 **Result:** {result_str}\n\n"
-        f"⏳ **Status:** Trade finalized."
-    )
+		f"🚀 **TARGET HIT | Another successful trade closed! 🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠**\n\n"
+		f"🚨 **Strategy: 🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠**\n"
+		f"💰 **Asset:** {asset}/USDT\n"
+		f"✅ **Entry:** {entry_price} USDT\n"
+		f"📉 **Exit:** {exit_price} USDT\n"
+		f"🔒 **Leverage:** {APALANCAMIENTO}x\n"
+		f"📅 **Opened:** {entry_date}\n"
+		f"📅 **Closed:** {close_date}\n"
+		f"📊 **Result:** 🟢 +{profit_leveraged:.2f}%\n\n"
+		f"📡 We work hard analyzing 5 high-volume cryptocurrencies: "
+		f"Bitcoin (BTC), ETH, BNB, ADA, and XRP.\n"
+		f"Our system runs on a robust platform with our own website, "
+		f"automated interface, real-time signals and 24/7 support.\n\n"
+		f"💎 We show verified results, "
+		f"all of our signals include a full 1-year trade history "
+		f"and are backed by real stats and public verification on the website.\n\n"
+		f"---\n"
+		f"🎁 Join our Premium Zone and access VIP signals with real and verified results.\n"
+		f"📌 *The data shown is from Bitcoin (1-year full history), but applying this strategy across 5 cryptocurrencies, results can be up to 5x greater.*\n\n"
+		f"• Real-time signals sent to our website and Telegram\n"
+		f"• Public trade history (12 full months)\n"
+		f"• Live charting platform with multi-timeframe analysis\n"
+		f"• Economic calendar and daily market news\n"
+		f"• 24/7 support for any questions or setup help\n\n"
+		f"---\n"
+		f"🪙 𝐃𝐄𝐋𝐓𝐀 𝐒𝐰𝐢𝐧𝐠 – FREE 🎉\n"
+		f"📊 Real-time signals, live charts and full market analysis completely FREE for 7 days.\n\n"
+		f"🔑 Claim your FREE for 7 days now! 🚀\n"
+	)
 
-# ------------- Envío de mensajes a Telegram --------------
+# -------------------------------------------------------------------
+# 7. FUNCIONES DE ENVÍO A TELEGRAM
+# -------------------------------------------------------------------
 def send_telegram_group_message_with_button_es(chat_id, thread_id, text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN_DELTA}/sendMessage"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN_FIRE}/sendMessage"
     botones = {
-        "inline_keyboard": [[
-            {
-                "text": "📊 Ver gráficos, señales en vivo",
-                "url": "https://cryptosignalbot.com/swing-trading-crypto-signal-bot-delta-swing/",
-            }
-        ]]
+        "inline_keyboard": [
+            [{"text":"📊 Ver gráficos en vivo","url":"https://cryptosignalbot.com/swing-trading-crypto-signal-bot-delta-swing/"}]
+        ]
     }
     payload = {
-        "chat_id": chat_id,
-        "message_thread_id": thread_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "reply_markup": botones,
+        'chat_id': chat_id,
+        'message_thread_id': thread_id,
+        'text': text,
+        'parse_mode': 'Markdown',
+        'reply_markup': botones
     }
-    resp = requests.post(url, json=payload)
-    print(f"[DEBUG][ES] Grupo: {resp.json()}")
+    requests.post(url, json=payload)
+
+def send_telegram_channel_message_with_button_es(chat_id, text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN_FIRE}/sendMessage"
+    botones = {
+        "inline_keyboard": [
+            [{"text":"🎁 Señales VIP","url":"https://t.me/CriptoSignalBotGestion_bot"}]
+        ]
+    }
+    payload = {
+        'chat_id': chat_id,
+        'text': text,
+        'parse_mode': 'Markdown',
+        'reply_markup': botones
+    }
+    requests.post(url, json=payload)
 
 def send_telegram_group_message_with_button_en(chat_id, thread_id, text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN_DELTA}/sendMessage"
+    url = f"https://api.telegram.org/bot{BOT_TOKEN_FIRE}/sendMessage"
     botones = {
-        "inline_keyboard": [[
-            {
-                "text": "📊 View charts & live signals",
-                "url": "https://cryptosignalbot.com/swing-trading-crypto-signal-bot-delta-swing/",
-            }
-        ]]
+        "inline_keyboard": [
+            [{"text":"📊 View live charts","url":"https://cryptosignalbot.com/swing-trading-crypto-signal-bot-delta-swing/"}]
+        ]
     }
     payload = {
-        "chat_id": chat_id,
-        "message_thread_id": thread_id,
-        "text": text,
-        "parse_mode": "Markdown",
-        "reply_markup": botones,
+        'chat_id': chat_id,
+        'message_thread_id': thread_id,
+        'text': text,
+        'parse_mode': 'Markdown',
+        'reply_markup': botones
     }
-    resp = requests.post(url, json=payload)
-    print(f"[DEBUG][EN] Group: {resp.json()}")
+    requests.post(url, json=payload)
 
-# ------------------------------ Utilidades --------------
+def send_telegram_channel_message_with_button_en(chat_id, text):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN_FIRE}/sendMessage"
+    botones = {
+        "inline_keyboard": [
+            [{"text":"🎁 VIP Signals","url":"https://t.me/CriptoSignalBotGestion_bot"}]
+        ]
+    }
+    payload = {
+        'chat_id': chat_id,
+        'text': text,
+        'parse_mode': 'Markdown',
+        'reply_markup': botones
+    }
+    requests.post(url, json=payload)
+
+# -------------------------------------------------------------------
+# 8. UTILIDADES
+# -------------------------------------------------------------------
 def enviar_a_wordpress(endpoint, payload):
     try:
-        resp = requests.post(endpoint, json=payload)
-        print(f"[DEBUG] WP resp ({endpoint}): {resp.text}")
-    except Exception as e:
-        print(f"[ERROR] Enviando a WordPress: {e}")
+        requests.post(endpoint, json=payload)
+    except:
+        pass
 
 def identificar_activo_es(ticker):
     t = ticker.upper()
-    if "BTC" in t: return "BTC", TOPICS_ES["BTC"]
-    if "ETH" in t: return "ETH", TOPICS_ES["ETH"]
-    if "ADA" in t: return "ADA", TOPICS_ES["ADA"]
-    if "XRP" in t: return "XRP", TOPICS_ES["XRP"]
-    if "BNB" in t: return "BNB", TOPICS_ES["BNB"]
-    return None, None
+    if "BTC" in t: return ("BTC", TOPICS_ES["BTC"])
+    if "ETH" in t: return ("ETH", TOPICS_ES["ETH"])
+    if "ADA" in t: return ("ADA", TOPICS_ES["ADA"])
+    if "XRP" in t: return ("XRP", TOPICS_ES["XRP"])
+    if "BNB" in t: return ("BNB", TOPICS_ES["BNB"])
+    return (None, None)
 
 def identificar_activo_en(ticker):
     t = ticker.upper()
-    if "BTC" in t: return "BTC", TOPICS_EN["BTC"]
-    if "ETH" in t: return "ETH", TOPICS_EN["ETH"]
-    if "ADA" in t: return "ADA", TOPICS_EN["ADA"]
-    if "XRP" in t: return "XRP", TOPICS_EN["XRP"]
-    if "BNB" in t: return "BNB", TOPICS_EN["BNB"]
-    return None, None
+    if "BTC" in t: return ("BTC", TOPICS_EN["BTC"])
+    if "ETH" in t: return ("ETH", TOPICS_EN["ETH"])
+    if "ADA" in t: return ("ADA", TOPICS_EN["ADA"])
+    if "XRP" in t: return ("XRP", TOPICS_EN["XRP"])
+    if "BNB" in t: return ("BNB", TOPICS_EN["BNB"])
+    return (None, None)
 
-# ------------------------- Ejecutar Flask ---------------------------
-if __name__ == "__main__":
-    # inicia el hilo anti-idle antes de levantar Flask
+# -------------------------------------------------------------------
+# 9. ARRANQUE
+# -------------------------------------------------------------------
+@app.route('/ping', methods=['GET'])
+def ping():
+    return 'pong', 200
+
+if __name__ == '__main__':
     threading.Thread(target=_keep_alive, daemon=True).start()
     port = int(os.environ.get("PORT", 1000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host='0.0.0.0', port=port)
