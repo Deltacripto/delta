@@ -8,7 +8,7 @@ app = Flask(__name__)
 # -------------------------------------------------------------------
 # 2. CONFIGURACIONES ESENCIALES
 # -------------------------------------------------------------------
-BOT_TOKEN_DELTA      = "8111511646:AAHdDgF_YZLQ0gw7U-uY4li_1Qf_Osnh2Kw"
+BOT_TOKEN_DELTA  = "7876669003:AAEDoCKopyQY8d3-hjj4L_vdR3-TdNi_TMc"
 TELEGRAM_KEY         = "Bossio.18357009"
 
 # IDs de grupo y canal
