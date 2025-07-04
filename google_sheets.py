@@ -10,6 +10,9 @@ CREDS_FILE  = os.getenv("GOOGLE_CREDS_FILENAME", "credenciales_google.json")
 CREDS_JSON  = os.getenv("GOOGLE_CREDS_JSON")
 SHEET_NAME  = os.getenv("GOOGLE_SHEETS_NAME", "RegistroOperaciones")
 
+# Apalancamiento que usamos para mostrar profit_pct
+LEVERAGE    = 3
+
 def _ensure_creds_file() -> str:
     if CREDS_JSON:
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".json")
@@ -67,13 +70,14 @@ def registrar_salida(activo: str, precio: float):
             entry_str   = sheet.cell(fila_num, 2).value
             entry_price = float(str(entry_str).replace(",", "."))
 
-            # 3) Calcular y escribir stop_programada (3% abajo)
-            stop_prog = round(entry_price * 0.97, 6)
+            # 3) Calcular y escribir stop_programada (20% abajo)
+            stop_prog = round(entry_price * 0.80, 6)
             sheet.update_cell(fila_num, 6, stop_prog)
 
-            # 4) Calcular y escribir % de ganancia/pérdida (multiplicado por 10x para visual)
+            # 4) Calcular y escribir % de ganancia/pérdida apalancado
             exit_price = float(str(precio).replace(",", "."))
-            profit_pct = round(((exit_price - entry_price) / entry_price * 100) * 10, 2)
+            raw_pct    = (exit_price - entry_price) / entry_price * 100
+            profit_pct = round(raw_pct * LEVERAGE, 2)
             sheet.update_cell(fila_num, 7, profit_pct)
 
             # 5) Pintar la fila de rojo o verde según resultado
